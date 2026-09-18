@@ -1,0 +1,10 @@
+Cycle length             : 765 s
+DP sample time            : 1.0 s
+Required current range    : -10.17 to 59.42 A
+Baseline cost J (before)  : 95446.1073
+DP cost J (after)         : 48139.7507
+Cost reduction            : 49.56%
+Final SoC baseline        : 0.9010
+Final SoC DP              : 0.9076
+Peak |current| baseline   : 59.4 A
+Peak |current| DP         : 48.0 A
