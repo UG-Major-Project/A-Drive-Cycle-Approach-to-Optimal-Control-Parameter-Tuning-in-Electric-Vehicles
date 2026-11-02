@@ -3,7 +3,7 @@ Drop-in battery model built on SPPy's single particle model (SPM).
 https://github.com/m0in92/SPPy   (licence: CC BY-NC 4.0, non-commercial use)
 
 Same interface as main.Battery:
-    step(P_motor, P_regen) -> dict(I_batt, net_power, V_terminal, SoC)
+    step(P_motor, P_regen) -> dict(I_batt, net_power, V_terminal, SoC, T_batt)
 Sign convention of THIS model (as in main.py): discharge current is POSITIVE.
 SPPy itself treats discharge as NEGATIVE current; the sign is flipped inside.
 
@@ -23,6 +23,35 @@ voltage curve close to the original ECM pack (about 365 V at 50 % SoC).
 That is a lumped model: no cell-to-cell spread, no pack thermal model.
 `R_extra` adds pack-level series resistance (busbars, contactors, fuses),
 which the single-cell model otherwise lacks.
+
+Temperature (T_batt, degC)
+--------------------------
+Taken from SPPy's own lumped thermal model, which runs when isothermal=False
+(the default here). SPPy updates `cell.T` [K] every step by integrating (rk4)
+
+    rho*Vol*C_p * dT/dt = I*T*(dOCP_p/dT - dOCP_n/dT)      reversible heat
+                        + I*(V - (OCP_p - OCP_n))          irreversible heat
+                        - h*A*(T - T_amb)                  convection to ambient
+
+and the wrapper reads it back. Things to know:
+  * It is a SINGLE-CELL temperature: each cell carries I_pack/Np, with the
+    cell's own thermal mass (rho*Vol*C_p) and its own surface (h*A) to ambient.
+    Heat sharing between neighbouring cells and pack insulation are not modelled,
+    so treat T_batt as a cell temperature, not a pack-core temperature.
+  * The irreversible term uses the SPM's own overpotentials (kinetic and
+    diffusion), so it is larger than a plain I^2*R estimate.
+  * The coupling is two-way: SPPy passes cell.T into its terminal-voltage
+    calculation, so temperature feeds back into the voltage the wrapper sees.
+  * T_amb defaults to temp_init. Pass T_amb to start the cell away from ambient
+    (e.g. temp_init=273.15, T_amb=273.15 for a cold day).
+  * With isothermal=True the solver never touches cell.T, so T_batt stays at
+    temp_init.
+  * h, A, rho, Vol and C_p come from the parameter set (for Gao-Randall-Han:
+    h = 1 W/(m^2 K), A = 0.085 m^2), i.e. weak cooling, time constant of
+    several minutes. Replace them for a cooled pack.
+  * h_cool overrides that h. h_cool=0.0 removes cooling (adiabatic cell): the
+    cell then only heats up, and T_amb has no effect on the result (only the
+    starting temperature matters).
 
 SPPy setup: clone the repo and put the clone's ROOT folder (the one that
 contains both `SPPy/` and `parameter_sets/`) on the path, via the sppy_path
@@ -51,8 +80,8 @@ def _find_sppy_root(explicit=None):
 
 class SPMBattery:
     def __init__(self, dt=0.1, Ns=96, Np=30, soc0=0.9,
-                 param_set="Gao-Randall-Han", isothermal=True, temp_init=298.15,
-                 R_extra=0.0, sppy_path=None):
+                 param_set="Gao-Randall-Han", isothermal=False, temp_init=298.15,
+                 R_extra=0.0, sppy_path=None, T_amb=None, h_cool=None):
         root = _find_sppy_root(sppy_path)
         if root is None:
             raise ImportError(
@@ -79,6 +108,15 @@ class SPMBattery:
                 .InvalidSOCException
             V0 = self.solver.calc_terminal_potential(I_p_i=0.0, I_n_i=0.0)
 
+        # SPPy sets T_amb equal to the initial temperature; override if asked.
+        if T_amb is not None:
+            self.cell.T_amb_ = float(T_amb)
+
+        # Heat-transfer coefficient h [W/(m^2 K)]: parameter-set value unless overridden.
+        # h_cool=0.0 removes cooling entirely (adiabatic cell).
+        if h_cool is not None:
+            self.cell.h = float(h_cool)
+
         self.dt = dt
         self.Ns, self.Np = Ns, Np
         self.R_extra = R_extra
@@ -90,6 +128,9 @@ class SPMBattery:
         self.max_power_err = 0.0                       # worst |P_delivered - P_request| [W]
         self.max_V_cell = V0
         self.min_V_cell = V0
+        self.T_batt = self.cell.T - 273.15             # [degC]
+        self.max_T_batt = self.T_batt
+        self.min_T_batt = self.T_batt
 
     def _R_pack(self):
         return self.cell.R_cell * self.Ns / self.Np + self.R_extra
@@ -107,6 +148,7 @@ class SPMBattery:
 
         try:
             # SPPy convention: charge +, discharge -
+            # (with isothermal=False this call also advances cell.T)
             V_cell = self.solver.solve_iteration_one_step(
                 t_prev=self.t, dt=self.dt, I=-I_cell)
         except self._invalid_soc_exc as e:
@@ -121,5 +163,9 @@ class SPMBattery:
         self.min_V_cell = min(self.min_V_cell, V_cell)
         self.max_power_err = max(self.max_power_err,
                                  abs(V_terminal * I_pack - net_power))
+
+        self.T_batt = self.cell.T - 273.15             # SPPy cell temperature [degC]
+        self.max_T_batt = max(self.max_T_batt, self.T_batt)
+        self.min_T_batt = min(self.min_T_batt, self.T_batt)
         return dict(I_batt=I_pack, net_power=net_power,
-                    V_terminal=V_terminal, SoC=self.SoC)
+                    V_terminal=V_terminal, SoC=self.SoC, T_batt=self.T_batt)

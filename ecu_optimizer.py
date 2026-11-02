@@ -96,15 +96,15 @@ class TorqueMap:
     """
 
     def __init__(self, v_bp, T_max_bp, scale=1.0, T_floor_bp=None):
-        self.v_bp = np.asarray(v_bp, dtype=float)
-        self.T_bp = np.asarray(T_max_bp, dtype=float)
-        self.scale = scale
-        self.T_floor_bp = None if T_floor_bp is None else np.asarray(T_floor_bp, float)
+        self.v_bp = np.asarray(v_bp, dtype=float) # 
+        self.T_bp = np.asarray(T_max_bp, dtype=float) # 
+        self.scale = scale # scaled by this value, used when sweeping
+        self.T_floor_bp = None if T_floor_bp is None else np.asarray(T_floor_bp, float) 
 
     def cap(self, v):
         c = self.scale * float(np.interp(v, self.v_bp, self.T_bp))
         if self.T_floor_bp is not None:
-            c = max(c, float(np.interp(v, self.v_bp, self.T_floor_bp)))
+            c = max(c, float(np.interp(v, self.v_bp, self.T_floor_bp))) # figure out the torque from interpolating the table values, and applying upper threshold
         return max(c, 0.0)
 
     @classmethod
@@ -112,10 +112,10 @@ class TorqueMap:
                       resist_margin=1.5, m=1500.0, Cd=0.28, A=2.2, rho=1.225,
                       Crr=0.01, g=9.81, r_wheel=0.30, G=9.0):
         """Table = max positive torque demanded per speed bin in a baseline run."""
-        v, T_req = np.asarray(v), np.asarray(T_req)
-        edges = np.arange(0.0, v.max() + bin_w, bin_w)
-        centers = 0.5 * (edges[:-1] + edges[1:])
-        env = np.full(len(centers), np.nan)
+        v, T_req = np.asarray(v), np.asarray(T_req) # torque required and speed
+        edges = np.arange(0.0, v.max() + bin_w, bin_w) # array which stores the envelope 
+        centers = 0.5 * (edges[:-1] + edges[1:]) # mid point of values
+        env = np.full(len(centers), np.nan) 
         for i in range(len(centers)):
             sel = (v >= edges[i]) & (v < edges[i + 1]) & (T_req > 0)
             if sel.any():
@@ -124,8 +124,8 @@ class TorqueMap:
         if not ok.any():
             raise ValueError("baseline run has no positive torque demand")
         env = np.interp(centers, centers[ok], env[ok])   # fill unvisited bins
-        F_res = m * g * Crr + 0.5 * rho * Cd * A * centers ** 2
-        floor = resist_margin * F_res * r_wheel / G
+        F_res = m * g * Crr + 0.5 * rho * Cd * A * centers ** 2 # rolling + aero
+        floor = resist_margin * F_res * r_wheel / G # 
         return cls(centers, np.maximum(env, T_floor), scale, T_floor_bp=floor)
 
     @classmethod

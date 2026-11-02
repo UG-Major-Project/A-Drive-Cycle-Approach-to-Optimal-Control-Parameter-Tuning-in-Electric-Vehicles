@@ -93,7 +93,7 @@ def main():
                    default=[0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0])
     p.add_argument("--bin-w", type=float, default=2.5, help="speed bin width [m/s]")
     p.add_argument("--kb", type=float, default=1.0, help="anti-windup gain")
-    p.add_argument("--rmse-tol", type=float, default=0.3,
+    p.add_argument("--rmse-tol", type=float, default=0.7,
                    help="max allowed RMSE increase vs baseline [m/s]")
     p.add_argument("--battery", choices=["spm", "ecm"], default=None,
                    help="override main.BATTERY_MODEL (spm is ~10 s per full-cycle run)")

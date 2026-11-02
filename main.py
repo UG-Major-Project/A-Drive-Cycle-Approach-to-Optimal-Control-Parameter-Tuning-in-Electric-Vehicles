@@ -13,7 +13,6 @@ import sys
 import numpy as np
 _trapz = getattr(np, 'trapezoid', None) or np.trapz
 import matplotlib
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from ecu_optimizer import ThrottleRateLimiter, TorqueMap, PowerRateLimiter
@@ -190,8 +189,17 @@ class VehicleDynamics:
 
 
 # -------------------------------------------------------------- Battery SoC
+"""ECM Battery with temperature output. Paste this class into main.py in place of
+the existing Battery (keep your own DT, np and the rest of the file), and keep
+thermal.py next to main.py. step() now also returns 'T_batt' [degC].
+
+Heat generation here is the ECM's own resistive loss, R0*I^2 + Vc1^2/R1, fed into
+the single-node thermal model in thermal.py. C_th and hA are placeholders.
+"""
+
+from thermal import LumpedThermal
 class Battery:
-    def __init__(self, dt=DT):
+    def __init__(self, dt=DT, temp_init=398.15, T_amb=None, C_th=1.3e5, hA=30.0):
         self.dt = dt
         self.Q = 50 * 3600.0
         self.R0, self.R1, self.C1 = 0.05, 0.03, 2000.0
@@ -199,6 +207,7 @@ class Battery:
         self.Voc_bp = np.array([320, 345, 355, 362, 367, 372, 378, 392.0])
         self.SoC = 1.0
         self.Vc1 = 0.0
+        self.thermal = LumpedThermal(dt, temp_init, T_amb, C_th, hA)
 
     def _voc(self, soc):
         # linear interpolation with linear extrapolation (matches interp1 'extrap')
@@ -219,12 +228,13 @@ class Battery:
         I2 = (-b - np.sqrt(disc)) / (2 * a)
         I_batt = I1 if abs(I1) <= abs(I2) else I2
 
+        Q_gen = I_batt ** 2 * self.R0 + self.Vc1 ** 2 / self.R1   # resistive heat [W]
         self.Vc1 += (self.dt / self.C1) * (I_batt - self.Vc1 / self.R1)
         V_terminal = Voc - I_batt * self.R0 - self.Vc1
         self.SoC = min(max(self.SoC - I_batt * self.dt / self.Q, 0.0), 1.0)
+        T_batt = self.thermal.step(Q_gen)
         return dict(I_batt=I_batt, net_power=net_power,
-                    V_terminal=V_terminal, SoC=self.SoC)
-
+                    V_terminal=V_terminal, SoC=self.SoC, T_batt=T_batt)
 
 def make_battery():
     """Battery factory. BATTERY_MODEL (set in the config block at the bottom of
@@ -251,9 +261,27 @@ def synthetic_cycle(dt=DT):
 def load_cycle(path, dt=DT):
     data = np.loadtxt(path, skiprows=1)
     t_raw, v_raw = data[:, 0], data[:, 1]          # v in m/s, check units!
+    print(len(v_raw))
     v_raw *= 0.44705 # conversion to m/s
     t = np.arange(t_raw[0], t_raw[-1] + dt, dt)
     return t, np.interp(t, t_raw, v_raw)
+
+
+def repeat_cycle(t, v_ref, n_laps, dt=DT):
+    """Tile a drive cycle n_laps times back-to-back as ONE continuous run.
+
+    simulate() is called once on the longer cycle, so battery temperature, SoC
+    and every other state carry over from lap to lap. The time axis keeps
+    increasing, so plots and metrics cover all laps.
+    """
+    if n_laps <= 1:
+        return t, v_ref
+    if abs(v_ref[-1] - v_ref[0]) > 0.1:
+        print(f"WARNING: cycle ends at {v_ref[-1]:.2f} m/s but starts at {v_ref[0]:.2f} m/s; "
+              "there will be a speed step at each lap boundary.")
+    v_rep = np.tile(v_ref, n_laps)
+    t_rep = t[0] + dt * np.arange(len(v_rep))
+    return t_rep, v_rep
 
 
 # ---------------------------------------------------------------- Simulation
@@ -289,7 +317,7 @@ def simulate(t, v_ref, is_ecu, driver=None, open_loop_u=None,
 
     keys = ["v_ref", "v", "a", "dist", "u", "T_req", "T_actual", "F_motor",
             "F_brake", "P_motor", "P_regen", "I_q", "T_temp", "I_batt",
-            "V_terminal", "SoC", "u_new", "v_diff"]
+            "V_terminal", "SoC", "u_new", "v_diff","T_batt"]
     log = {k: np.zeros(len(t)) for k in keys}
 
     v_act = 0.0                                     # Unit Delay output
@@ -310,23 +338,27 @@ def simulate(t, v_ref, is_ecu, driver=None, open_loop_u=None,
                              P_motor=m["P_motor"], P_regen=m["P_regen"],
                              I_q=m["I_q"], T_temp=m["T_temp"],
                              I_batt=b["I_batt"], V_terminal=b["V_terminal"],
-                             SoC=b["SoC"], u_new=u_new, v_diff=v_diff).items():
+                             SoC=b["SoC"], u_new=u_new, v_diff=v_diff,T_batt=b["T_batt"]).items():
             log[key][k] = val
         v_act = v                                    # unit delay
     return log
 
 
-def summarize(t, log):
+def summarize(t, log, label=""):
     err = log["v_ref"] - log["v"]
     rmse = np.sqrt(np.mean(err ** 2))
     d_ref = _trapz(log["v_ref"], t)
     d_act = log["dist"][-1]
     E_kWh = _trapz(log["P_motor"] - log["P_regen"], t) / 3.6e6
+    T_b = log["T_batt"]
+    if label:
+        print(f"--- {label} ---")
     print(f"Speed RMSE      : {rmse:.3f} m/s   (max |err| {np.max(abs(err)):.2f})")
     print(f"Distance        : {d_act:.0f} m actual vs {d_ref:.0f} m reference")
     print(f"Net battery E   : {E_kWh:.3f} kWh   ({E_kWh / max(d_act/1000, 1e-6) * 1000:.0f} Wh/km)")
     print(f"Final SoC       : {log['SoC'][-1]:.4f}")
-    print(f"Peak motor temp : {log['T_temp'].max():.2f} degC")
+    print(f"Peak Battery temp : {T_b.max():.2f} degC   "
+          f"(start {T_b[0]:.2f}, rise {T_b.max() - T_b[0]:.2f} K)")
 
 
 def metrics(t, log):
@@ -337,7 +369,7 @@ def metrics(t, log):
     d_km = max(log["dist"][-1] / 1000.0, 1e-6)
     E_kWh = _trapz(log["P_motor"] - log["P_regen"], t) / 3.6e6
     return dict(
-        peak_I=float(np.max(np.abs(I))),
+        peak_I=float(np.max((I))),
         rms_I=float(np.sqrt(np.mean(I ** 2))),
         max_dIdt=float(np.max(np.abs(np.diff(I))) / dt),
         rmse=float(np.sqrt(np.mean(err ** 2))),
@@ -381,7 +413,7 @@ def top_didt_events(t, log, n=5):
 
 
 def compare(m_ecu, m_base):
-    rows = [("Peak |I_batt| [A]", "peak_I", "{:.1f}"),
+    rows = [("Peak |I_batt| [A]", "peak_I", "{:.2f}"),
             ("RMS I_batt [A]", "rms_I", "{:.2f}"),
             ("Max |dI/dt| [A/s]", "max_dIdt", "{:.0f}"),
             ("Speed RMSE [m/s]", "rmse", "{:.3f}"),
@@ -402,8 +434,8 @@ def plot(t, log, log1, fname):
     ax[1].plot(t, log["u"], label="PI output u")
     ax[1].plot(t, log["u_new"], label="ECU out u")
     ax[1].set_ylabel("pedal (-1..1)"); ax[1].grid(True)
-    ax[2].plot(t, log["T_req"], "--", label="T_req")
     ax[2].plot(t, log["T_actual"], label="T_actual")
+    ax[2].plot(t, log["T_req"], "--", label="T_req")
     ax[2].set_ylabel("Nm"); ax[2].legend(); ax[2].grid(True)
     ax[3].plot(t, (log["P_motor"] - log["P_regen"]) / 1e3)
     ax[3].set_ylabel("battery power kW"); ax[3].grid(True)
@@ -411,26 +443,37 @@ def plot(t, log, log1, fname):
     ax[4].set_ylabel("SoC %"); ax[4].set_xlabel("time (s)"); ax[4].grid(True)
     ax[5].plot(t, log["v_diff"]);ax[5].set_xlabel("time (s)"); ax[5].grid(True)
     ax[5].set_ylabel("m/s")
-    ax[6].plot(t, log["I_batt"], label="With ECU");ax[6].set_xlabel("time (s)"); ax[6].grid(True)
     ax[6].plot(t, log1["I_batt"], label ="Without ECU");ax[6].set_xlabel("time (s)"); ax[6].grid(True)
+    ax[6].plot(t, log["I_batt"], "--", label="With ECU");ax[6].set_xlabel("time (s)"); ax[6].grid(True)
     ax[6].set_ylabel("A");ax[6].legend()
     fig.tight_layout()
+    plt.show()
     fig.savefig(fname, dpi=110)
     print("saved", fname)
 
 
-filename = "uddscol.txt"
+filename = "us06col.txt"
 
 BATTERY_MODEL = "spm"  # "spm" = SPPy single particle model, "ecm" = original Thevenin model
-BATTERY_KW = dict(     # SPM pack: Ns x Np cells of the 1.65 Ah Gao-Randall-Han set
-    Ns=96, Np=30,      #   96s30p = 49.5 Ah, ~384 V at 90 % SoC
-    soc0=0.9,          #   start below 100 % so regen has voltage headroom
-    R_extra=0.0,       #   extra pack series resistance [Ohm] (busbars, contactors)
-    isothermal=True)   #   False = SPPy lumped cell thermal model
+BATTERY_KW = dict(
+    Ns=96, Np=30,
+    soc0=0.9,
+    R_extra=0.0,
+    isothermal=False,
+    temp_init=308.15,   # start at 35 degC
+    T_amb=308.15,       # 35 degC (no effect while h_cool=0)
+    h_cool=0.0,         # 0 = no cooling
+)
 CAL_FILE = None        # calibrate on a different cycle (recommended); None = same cycle
 
 START_TIME = 0         # evaluation window [s]
 MAX_TIME = None        # integer seconds, or None for the full cycle
+
+REPEAT_CYCLE = False   # True = run the evaluation cycle back-to-back N_LAPS times as one
+                       # continuous run (battery temperature and SoC carry over between laps).
+                       # The ECU calibration still uses a single lap.
+N_LAPS = 15             # number of laps when REPEAT_CYCLE is True; SoC falls every lap, and the
+                       # SPM raises an error if the pack runs out of range
 
 TORQUE_SCALE = 0.8     # scale on the baseline torque-demand envelope (0 = off)
 DPDT_FRAC = 0.5        # dP/dt limit as a fraction of baseline peak (0 = off)
@@ -456,14 +499,18 @@ if __name__ == "__main__":
     if v_ref[0] > 0.1:
         print(f"WARNING: v_ref[0] = {v_ref[0]:.2f} m/s but the vehicle starts at 0; "
               "the first seconds will be a start-up transient.")
+    n_laps = N_LAPS if REPEAT_CYCLE else 1
+    t, v_ref = repeat_cycle(t, v_ref, n_laps)
+    if n_laps > 1:
+        print(f"Back-to-back laps: {n_laps}  ({t[-1] - t[0]:.0f} s total)\n")
     log = simulate(t, v_ref, True, **ecu_cfg)
     log1 = simulate(t, v_ref, False)
     if BATTERY_MODEL == "spm":
         vc = log["V_terminal"] / BATTERY_KW["Ns"]
         print(f"SPM cell voltage with ECU: {vc.min():.3f} .. {vc.max():.3f} V "
               f"(SPM limits 2.5 .. 4.2 V; no charge limiting is modelled)\n")
-    summarize(t, log)
-    summarize(t, log1)
+    summarize(t, log, "With ECU")
+    summarize(t, log1, "Without ECU (baseline)")
     compare(metrics(t, log), metrics(t, log1))
     top_didt_events(t, log1)
     plot(t, log, log1, "with_ecu.png")
